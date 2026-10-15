@@ -162,12 +162,21 @@ current_message(Base, Opts) ->
         _ -> init_message(Base, RefID, Opts)
     end.
 
-%% @doc Return the `init' message for the reference. If `Base' is itself
-%% the init we return it directly; otherwise we look it up in the local
-%% cache.
+%% @doc Return the authenticated fields of the reference's `init' message,
+%% falling back to its canonical cached init when the base does not verify.
 init_message(Base, RefID, Opts) ->
-    case is_init(Base, Opts) of
-        true -> Base;
+    Signers = #{ <<"committers">> => <<"all">> },
+    case is_init(Base, Opts)
+        andalso hb_message:id(Base, signed, Opts) =:= RefID
+        andalso hb_message:verify(Base, Signers, Opts)
+    of
+        true ->
+            hb_message:with_links(
+                [<<"commitments">>, <<"priv">> |
+                    hb_message:committed(Base, Signers, Opts)],
+                Base,
+                Opts
+            );
         false ->
             case cache_read(init_path(RefID), Opts) of
                 {ok, Init} -> Init;
@@ -709,6 +718,65 @@ compute_returns_init_when_no_set_applied_test() ->
     ?assertEqual(
         hb_message:id(Init, signed, Opts),
         hb_message:id(Got, signed, Opts)).
+
+init_overlay_test_() ->
+    [
+        {atom_to_list(Kind) ++ "/" ++ atom_to_list(Cached),
+            fun() -> init_overlay(Kind, Cached) end}
+    || Kind <- [overwrite, authority, value], Cached <- [false, true]
+    ].
+
+%% @doc Caller overlays cannot change the authenticated init's fields.
+init_overlay(Kind, Cached) ->
+    Wallet = ar_wallet:new(),
+    Opts = (fresh_opts())#{
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+    },
+    Fields = #{ <<"device">> => <<"reference@1.0">>, <<"timestamp">> => 1 },
+    Init = hb_message:commit(
+        case Kind of
+            overwrite -> Fields#{ <<"authority">> => addr(Wallet) };
+            _ -> Fields
+        end,
+        opts_with_wallet(Opts, Wallet)),
+    RefID = hb_message:id(Init, signed, Opts),
+    {ok, _} = hb_ao:resolve(Init, <<"compute">>, Opts),
+    case Cached of
+        true -> prime_init(RefID, Init, Opts#{ <<"cache-control">> => [<<"always">>] });
+        false -> ok
+    end,
+    Overlay =
+        case Kind of
+            value -> #{ <<"reference-value">> => <<"untrusted">> };
+            _ -> #{ <<"authority">> => addr(ar_wallet:new()) }
+        end,
+    Result = hb_ao:resolve(hb_maps:merge(Init, Overlay, Opts), <<"compute">>, Opts),
+    case {Kind, Cached} of
+        {overwrite, false} -> ?assertMatch({error, _}, Result);
+        _ ->
+            {ok, Got} = Result,
+            ?assertEqual(1, hb_maps:get(<<"timestamp">>, Got, Opts)),
+            ?assertEqual(<<"reference@1.0">>, hb_maps:get(<<"device">>, Got, Opts)),
+            ?assertEqual(
+                hb_maps:get(<<"authority">>, Init, undefined, Opts),
+                hb_maps:get(<<"authority">>, Got, undefined, Opts)),
+            ?assertNot(hb_maps:is_key(<<"reference-value">>, Got, Opts))
+    end.
+
+init_with_multiple_commitments_test() ->
+    Opts = opts_with_wallet(fresh_opts(), ar_wallet:new()),
+    Fields = #{ <<"device">> => <<"reference@1.0">>, <<"timestamp">> => 1 },
+    A = hb_message:commit(Fields, Opts),
+    B = hb_message:commit(Fields, Opts, <<"ans104@1.0">>),
+    Init = Fields#{
+        <<"commitments">> => hb_maps:merge(
+            hb_maps:get(<<"commitments">>, A, Opts),
+            hb_maps:get(<<"commitments">>, B, Opts),
+            Opts)
+    },
+    ?assertEqual(2, hb_maps:size(hb_maps:get(<<"commitments">>, Init, Opts), Opts)),
+    {ok, Got} = hb_ao:resolve(Init, <<"compute">>, Opts),
+    ?assertEqual(hb_message:id(Init, signed, Opts), hb_message:id(Got, signed, Opts)).
 
 compute_returns_latest_set_value_test() ->
     Opts = fresh_opts(),
